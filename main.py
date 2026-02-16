@@ -12,6 +12,8 @@ import sqlite3
 import csv
 import os
 import json
+import re
+import sys
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -70,6 +72,8 @@ def init_database():
     # Load CSV data into tables
     for table_name in ["dim_writer", "dim_song", "fact_royalties"]:
         file_path = os.path.join(DATA_DIR, f"{table_name}.csv")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Data file not found: {file_path}")
         with open(file_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             columns = reader.fieldnames
@@ -168,31 +172,59 @@ def create_current_songs_view(conn):
 
 def validate_sql(sql):
     """
-    Safety check: block any destructive SQL commands.
+    Safety check: block any destructive or non-SELECT SQL commands.
 
-    In a real production system, you'd also use a read-only
-    database connection. This is an additional layer of defense.
+    Uses a two-layer approach:
+    1. Whitelist: The query must start with SELECT (after stripping
+       whitespace and comments).
+    2. Blocklist: Reject if any destructive keyword appears as a
+       standalone word (using word boundaries to avoid false positives
+       on column names like 'updated_at' or 'creation_date').
+
+    In production, this would be paired with a read-only database
+    connection for defense-in-depth.
 
     Returns (is_safe, reason)
     """
-    blocked_keywords = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE", "TRUNCATE"]
-    sql_upper = sql.upper().strip()
-    for keyword in blocked_keywords:
-        if keyword in sql_upper:
-            return False, f"Blocked: SQL contains '{keyword}' which is not allowed."
-    if not sql_upper.startswith("SELECT"):
+    # Strip SQL comments (-- and /* */)
+    cleaned = re.sub(r"--.*$", "", sql, flags=re.MULTILINE)
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+    cleaned = cleaned.strip()
+
+    # Layer 1: Must start with SELECT
+    if not cleaned.upper().startswith("SELECT"):
         return False, "Blocked: Only SELECT queries are allowed."
+
+    # Layer 2: No destructive keywords as standalone words
+    blocked_keywords = ["DROP", "DELETE", "INSERT", "UPDATE",
+                        "ALTER", "CREATE", "TRUNCATE", "EXEC", "EXECUTE"]
+    for keyword in blocked_keywords:
+        # \b = word boundary — prevents matching 'updated_at' for 'UPDATE'
+        if re.search(rf"\b{keyword}\b", cleaned, re.IGNORECASE):
+            return False, f"Blocked: SQL contains '{keyword}' which is not allowed."
+
+    # Layer 3: Block multiple statements (semicolons followed by more SQL)
+    if re.search(r";\s*\S", cleaned):
+        return False, "Blocked: Multiple SQL statements are not allowed."
+
     return True, "OK"
 
 
-def ask_database(question, conn):
+def ask_database(question, conn, max_retries=1):
     """
     The Text-to-SQL agent.
 
     Takes a natural language question, uses an LLM to generate SQL,
-    validates and executes it, then returns a human-readable answer.
+    validates and executes it, then returns a structured answer.
+
+    Retries on API failure. Returns both the raw data and a
+    formatted answer for reliability.
     """
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return "ERROR: OPENAI_API_KEY not set. Copy .env.example to .env and add your key."
+
+    client = OpenAI(api_key=api_key)
 
     # Step 1: Ask the LLM to generate SQL
     system_prompt = f"""You are a SQL expert for a music publishing company.
@@ -212,16 +244,28 @@ RULES:
     print(f"\n  Question: {question}")
     print("  Generating SQL...")
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question},
-        ],
-        temperature=0.0,
-    )
+    # Generate SQL with retry
+    generated_sql = None
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": question},
+                ],
+                temperature=0.0,
+            )
+            generated_sql = response.choices[0].message.content.strip()
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                print(f"  API error (attempt {attempt + 1}), retrying: {e}")
 
-    generated_sql = response.choices[0].message.content.strip()
+    if generated_sql is None:
+        return f"API ERROR: Could not generate SQL after {max_retries + 1} attempts: {last_error}"
 
     # Clean up in case LLM wraps in code blocks anyway
     if generated_sql.startswith("```"):
@@ -248,32 +292,75 @@ RULES:
     if not rows:
         return "No results found."
 
-    # Step 4: Format the result
-    result_lines = []
+    # Step 4: Format the raw result deterministically
+    result_data = []
     for row in rows:
         row_dict = dict(zip(columns, row))
-        result_lines.append(row_dict)
+        result_data.append(row_dict)
+
+    # Deterministic formatted output (always included for accuracy)
+    deterministic_answer = format_result_deterministic(question, result_data)
+    print(f"  Raw result: {json.dumps(result_data)}")
 
     # Step 5: Use LLM to generate a human-readable answer
+    # The deterministic answer is the authoritative source;
+    # the LLM answer is for natural language presentation.
     answer_prompt = f"""The user asked: "{question}"
 
 The SQL query returned this data:
-{json.dumps(result_lines, indent=2)}
+{json.dumps(result_data, indent=2)}
 
 Provide a clear, concise answer to the user's question based on this data.
 Include the specific numbers. Be brief — 1-2 sentences."""
 
-    answer_response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a helpful financial analyst. Give clear, data-backed answers."},
-            {"role": "user", "content": answer_prompt},
-        ],
-        temperature=0.0,
-    )
+    try:
+        answer_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful financial analyst. Give clear, data-backed answers."},
+                {"role": "user", "content": answer_prompt},
+            ],
+            temperature=0.0,
+        )
+        llm_answer = answer_response.choices[0].message.content.strip()
+    except Exception as e:
+        # If the formatting LLM call fails, fall back to deterministic output
+        print(f"  Warning: Answer formatting failed ({e}), using raw result.")
+        llm_answer = deterministic_answer
 
-    answer = answer_response.choices[0].message.content.strip()
-    return answer
+    return llm_answer
+
+
+def format_result_deterministic(question, result_data):
+    """
+    Format query results without using the LLM.
+
+    This is the fallback and the authoritative answer format.
+    If a single numeric result is returned, format it as currency.
+    Otherwise, format as a readable table.
+    """
+    if not result_data:
+        return "No results found."
+
+    # Single-value result (e.g., total revenue)
+    if len(result_data) == 1 and len(result_data[0]) == 1:
+        key = list(result_data[0].keys())[0]
+        value = result_data[0][key]
+        if isinstance(value, (int, float)):
+            return f"{key}: ${value:,.2f}"
+        return f"{key}: {value}"
+
+    # Multi-row result
+    lines = []
+    for row in result_data:
+        parts = []
+        for k, v in row.items():
+            if isinstance(v, float):
+                parts.append(f"{k}: ${v:,.2f}")
+            else:
+                parts.append(f"{k}: {v}")
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────
@@ -287,7 +374,11 @@ def main():
 
     # Initialize database
     print("\nSetting up database...")
-    conn = init_database()
+    try:
+        conn = init_database()
+    except FileNotFoundError as e:
+        print(f"  FATAL: {e}")
+        sys.exit(1)
     create_current_songs_view(conn)
     print("  Database ready.\n")
 

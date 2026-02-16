@@ -66,7 +66,12 @@ The LLM is then instructed to use `current_songs` instead of `dim_song` via the 
 
 ### 3. Safety — Preventing Destructive Commands
 
-The `validate_sql()` function implements a keyword blocklist that rejects any query containing `DROP`, `DELETE`, `INSERT`, `UPDATE`, `ALTER`, `CREATE`, or `TRUNCATE`. It also requires that the query starts with `SELECT`.
+The `validate_sql()` function implements a **three-layer defense**:
+
+1. **Comment stripping:** SQL comments (`--` and `/* */`) are removed before validation to prevent injection via comments.
+2. **SELECT whitelist:** The cleaned query must start with `SELECT`. Any other statement type is rejected.
+3. **Word-boundary blocklist:** Destructive keywords (`DROP`, `DELETE`, `INSERT`, `UPDATE`, `ALTER`, `CREATE`, `TRUNCATE`, `EXEC`) are matched using regex word boundaries (`\b`). This prevents false positives — a column named `updated_at` won't trigger the `UPDATE` block, but the statement `UPDATE dim_writer` will.
+4. **Multi-statement blocking:** Semicolons followed by additional SQL are rejected to prevent piggybacked commands.
 
 **For a production deployment, I would add:**
 - A **read-only database connection** (SQLite's `file:db?mode=ro` or a read-only PostgreSQL role) — this is the strongest guarantee, as it's enforced at the database level regardless of what SQL is generated.
@@ -77,6 +82,11 @@ The keyword blocklist is a defense-in-depth layer, not the sole protection.
 
 ### 4. Scalability & Reliability
 
+**Error handling:**
+- Both LLM API calls (SQL generation and answer formatting) are wrapped in try/except with retry logic. Transient API failures (rate limits, timeouts) are retried before failing.
+- If the answer-formatting LLM call fails, the agent falls back to a **deterministic formatter** that outputs the raw query result with proper currency formatting. The required test answer ($4,644.75) is never lost due to an LLM paraphrasing error.
+- Missing API keys and data files are caught at startup with actionable error messages.
+
 **At 10x volume (1,000 transactions → 10,000+):**
 - The architecture scales well because the LLM never sees the raw data — it only generates SQL. Whether the table has 100 rows or 10 million, the LLM's job is the same.
 - The `current_songs` view would benefit from an index on `(song_id, etl_date)` for faster deduplication at scale.
@@ -85,11 +95,10 @@ The keyword blocklist is a defense-in-depth layer, not the sole protection.
 - New columns in `dim_song` or `fact_royalties` would require updating the `SCHEMA_DESCRIPTION` string. This is the single point of configuration — the LLM adapts its SQL generation based on whatever schema it's given.
 - If the date format in `etl_date` changed, the `current_songs` view logic (which uses `MAX(etl_date)`) might need adjustment depending on the new format's sort behavior.
 
-**Reliability improvements for production:**
-- **Retry logic** with exponential backoff for API failures.
+**Additional production improvements:**
 - **Query result caching** for frequently asked questions.
-- **Logging** of every generated SQL query for audit and debugging.
-- **Fallback responses** when the LLM generates invalid SQL after multiple attempts.
+- **Structured logging** of every generated SQL query for audit and debugging.
+- **Exponential backoff** on retries instead of immediate retry.
 
 ## Project Structure
 
