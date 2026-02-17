@@ -16,6 +16,14 @@ cp .env.example .env
 python main.py
 ```
 
+## Run Tests
+
+Tests run without an OpenAI API key (all LLM calls are mocked):
+
+```bash
+python -m pytest tests/ -v
+```
+
 ## Test Output
 
 **Question:** "What is the total revenue for Alex Park?"
@@ -66,52 +74,63 @@ The LLM is then instructed to use `current_songs` instead of `dim_song` via the 
 
 ### 3. Safety — Preventing Destructive Commands
 
-The `validate_sql()` function implements a **three-layer defense**:
+The `validate_sql()` function implements a **multi-layer defense**:
 
 1. **Comment stripping:** SQL comments (`--` and `/* */`) are removed before validation to prevent injection via comments.
 2. **SELECT whitelist:** The cleaned query must start with `SELECT`. Any other statement type is rejected.
 3. **Word-boundary blocklist:** Destructive keywords (`DROP`, `DELETE`, `INSERT`, `UPDATE`, `ALTER`, `CREATE`, `TRUNCATE`, `EXEC`) are matched using regex word boundaries (`\b`). This prevents false positives — a column named `updated_at` won't trigger the `UPDATE` block, but the statement `UPDATE dim_writer` will.
 4. **Multi-statement blocking:** Semicolons followed by additional SQL are rejected to prevent piggybacked commands.
+5. **Input sanitisation:** User questions are truncated to 500 chars and control characters are stripped.
+6. **Auto-LIMIT:** A `LIMIT 1000` clause is appended if not already present, preventing accidental full-table dumps.
 
-**For a production deployment, I would add:**
-- A **read-only database connection** (SQLite's `file:db?mode=ro` or a read-only PostgreSQL role) — this is the strongest guarantee, as it's enforced at the database level regardless of what SQL is generated.
+**Production deployment includes:**
 - **Query execution timeouts** to prevent runaway queries from expensive JOINs.
-- **Parameterized output limits** (e.g., always append `LIMIT 1000`) to prevent accidental full-table dumps.
-
-The keyword blocklist is a defense-in-depth layer, not the sole protection.
+- **Exponential backoff** on API retries (configurable, default 3 retries).
+- **Structured logging** with rotating file handler for audit and debugging.
 
 ### 4. Scalability & Reliability
 
 **Error handling:**
-- Both LLM API calls (SQL generation and answer formatting) are wrapped in try/except with retry logic. Transient API failures (rate limits, timeouts) are retried before failing.
+- Both LLM API calls (SQL generation and answer formatting) are wrapped in try/except with exponential backoff retry logic. Transient API failures (rate limits, timeouts) are retried with increasing delays.
 - If the answer-formatting LLM call fails, the agent falls back to a **deterministic formatter** that outputs the raw query result with proper currency formatting. The required test answer ($4,644.75) is never lost due to an LLM paraphrasing error.
 - Missing API keys and data files are caught at startup with actionable error messages.
+- All operations are logged to both console and rotating log file.
 
 **At 10x volume (1,000 transactions → 10,000+):**
 - The architecture scales well because the LLM never sees the raw data — it only generates SQL. Whether the table has 100 rows or 10 million, the LLM's job is the same.
 - The `current_songs` view would benefit from an index on `(song_id, etl_date)` for faster deduplication at scale.
 
 **If the data format shifted:**
-- New columns in `dim_song` or `fact_royalties` would require updating the `SCHEMA_DESCRIPTION` string. This is the single point of configuration — the LLM adapts its SQL generation based on whatever schema it's given.
+- New columns in `dim_song` or `fact_royalties` would require updating the `SCHEMA_DESCRIPTION` in `config.py`. This is the single point of configuration — the LLM adapts its SQL generation based on whatever schema it's given.
 - If the date format in `etl_date` changed, the `current_songs` view logic (which uses `MAX(etl_date)`) might need adjustment depending on the new format's sort behavior.
-
-**Additional production improvements:**
-- **Query result caching** for frequently asked questions.
-- **Structured logging** of every generated SQL query for audit and debugging.
-- **Exponential backoff** on retries instead of immediate retry.
 
 ## Project Structure
 
 ```
 wcm-revenue-agent/
-  main.py              — Entry point with all logic
-  requirements.txt     — Python dependencies
-  .env.example         — API key template
-  .gitignore           — Excludes .env and caches
+  main.py                  — Entry point
+  requirements.txt         — Pinned Python dependencies
+  .env.example             — API key template
+  .gitignore               — Excludes .env, logs, caches
+  wcm_agent/               — Core application package
+    __init__.py
+    config.py              — Configuration, schema, constants
+    db.py                  — Database init, CSV loading, views
+    safety.py              — SQL validation, input sanitisation
+    agent.py               — LLM pipeline with retry logic
+    formatters.py          — Deterministic result formatter
+    logging_config.py      — Structured logging with rotation
+  tests/                   — Test suite (no API key required)
+    conftest.py            — Shared fixtures
+    test_safety.py         — SQL validation tests
+    test_formatters.py     — Formatter tests
+    test_db.py             — Database & view tests
+    test_agent.py          — Integration tests (mocked LLM)
   data/
-    dim_writer.csv     — Writer dimension table
-    dim_song.csv       — Song dimension table (with historical records)
-    fact_royalties.csv — Royalty transactions
+    dim_writer.csv         — Writer dimension table
+    dim_song.csv           — Song dimension table (with historical records)
+    fact_royalties.csv     — Royalty transactions
   output/
-    alex_park_result.txt — Test output
+    alex_park_result.txt   — Test output
+  logs/                    — Runtime logs (auto-created, gitignored)
 ```
