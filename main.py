@@ -93,5 +93,47 @@ def main():
     logger.info("Agent finished successfully")
 
 
+def interactive():
+    """Interactive mode — ask any question."""
+    setup_logging()
+
+    try:
+        validate_config()
+    except RuntimeError as e:
+        print(f"\n  FATAL: {e}")
+        sys.exit(1)
+
+    conn = init_database()
+    create_current_songs_view(conn)
+
+    print("=" * 50)
+    print("  WCM Revenue Agent — Interactive Mode")
+    print("=" * 50)
+    print("  Ask any question about the royalties database.")
+    print("  Type 'quit' or 'exit' to stop.\n")
+
+    while True:
+        try:
+            question = input("  You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Goodbye!")
+            break
+
+        if not question:
+            continue
+        if question.lower() in ("quit", "exit", "q"):
+            print("  Goodbye!")
+            break
+
+        answer = ask_database(question, conn)
+        print(f"  Agent: {answer}\n")
+
+    conn.close()
+    logger.info("Interactive session ended")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] in ("--interactive", "-i"):
+        interactive()
+    else:
+        main()
