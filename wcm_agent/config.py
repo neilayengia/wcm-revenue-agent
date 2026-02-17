@@ -60,6 +60,10 @@ RELATIONSHIPS:
 - dim_writer.writer_id → dim_song.writer_id (one writer has many songs)
 - dim_song.song_id → fact_royalties.song_id (one song has many royalty transactions)
 - Use current_songs instead of dim_song for accurate revenue calculations.
+
+IMPORTANT RULES:
+- Always use case-insensitive comparisons for text fields. Use LOWER() on both sides, e.g.: WHERE LOWER(dw.writer_name) = LOWER('Alex Park')
+- Always use ROUND(..., 2) for monetary amounts.
 """
 
 
